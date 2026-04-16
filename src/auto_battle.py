@@ -16,11 +16,66 @@ import logging
 import math
 import os
 import random
+import string
 import sys
 import threading
 import time
 import traceback
 import tkinter as tk
+from tkinter import messagebox
+
+
+# ====================================================
+# 依赖检查（在提权前执行，缺少则弹窗并禁止启动）
+# ====================================================
+
+def _check_dependencies():
+    """检测所有必需第三方依赖，未安装则弹窗列出并退出"""
+    missing = []
+    checks = [
+        ('cv2',           'opencv-python'),
+        ('numpy',         'numpy'),
+        ('interception',  'interception-python'),
+        ('win32api',      'pywin32'),
+        ('dxcam',         'dxcam'),
+    ]
+    for mod, pip_name in checks:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pip_name)
+
+    if missing:
+        root = tk.Tk()
+        root.withdraw()
+        msg = "以下依赖未安装，程序无法启动：\n\n"
+        for pkg in missing:
+            msg += f"  ● {pkg}\n"
+        msg += f"\n请在命令行运行以下命令安装：\n\npip install {' '.join(missing)}"
+        messagebox.showerror("依赖缺失", msg)
+        root.destroy()
+        sys.exit(1)
+
+    # Interception 驱动检查（非阻塞，仅警告）
+    import ctypes as _ct
+    _h = _ct.windll.kernel32.CreateFileA(
+        br'\\.\interception00', 0x80000000, 0, 0, 3, 0, 0)
+    if _h == -1 or _h == 0xFFFFFFFF:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "Interception 驱动未安装",
+            "Interception 驱动未安装或未生效（需重启电脑）。\n\n"
+            "当前将回退到 SendInput（带注入标志，可被检测）。\n\n"
+            "安装方法：\n"
+            "1. 运行 install-interception.exe /install\n"
+            "2. 重启电脑")
+        root.destroy()
+    else:
+        _ct.windll.kernel32.CloseHandle(_h)
+
+
+_check_dependencies()
 
 import cv2
 import numpy as np
@@ -78,6 +133,17 @@ except Exception:
         pass
 
 # ====================================================
+# 可选后端：Interception 驱动（输入）/ dxcam（截屏）
+# ====================================================
+
+import interception as _icp
+import dxcam as _dxcam_mod
+
+_USE_INTERCEPTION = False
+_USE_DXCAM = False
+_dxcam_camera = None
+
+# ====================================================
 # 日志
 # ====================================================
 
@@ -100,6 +166,7 @@ log.addHandler(_fh)
 
 log.info("=" * 40)
 log.info("脚本启动，管理员权限=%s", _is_admin())
+log.info("依赖检查通过，后端就绪: interception + dxcam")
 
 # ====================================================
 # 配置
@@ -111,6 +178,48 @@ BUTTON_TPL_THRESHOLD = 0.7           # 按钮模板匹配阈值
 BATTLE_TPL_THRESHOLD = 0.6           # "战报" 模板匹配阈值
 DEBUG_SAVE = True                    # 是否保存调试截图到 debug/ 文件夹
 MOUSE_MOVE_STEPS = 15                # 鼠标移动插值步数
+
+
+def _init_interception():
+    """延迟初始化 Interception 驱动（在用户首次操作鼠标/键盘后调用）"""
+    global _USE_INTERCEPTION
+    if _USE_INTERCEPTION:
+        return True
+    try:
+        _icp.auto_capture_devices(keyboard=True, mouse=True)
+        _USE_INTERCEPTION = True
+        log.info("Interception 驱动初始化成功 — 输入无 INJECTED 标志")
+        print("[后端] Interception 驱动已激活")
+    except Exception as e:
+        log.warning("Interception 初始化失败: %s，回退到 SendInput", e)
+        print(f"[后端] Interception 不可用，使用 SendInput")
+    return _USE_INTERCEPTION
+
+
+def _init_dxcam():
+    """初始化 DXGI Desktop Duplication 截屏"""
+    global _USE_DXCAM, _dxcam_camera
+    if _USE_DXCAM:
+        return True
+    try:
+        _dxcam_camera = _dxcam_mod.create()
+        _USE_DXCAM = True
+        log.info("dxcam (DXGI) 截屏初始化成功")
+        print("[后端] DXGI 截屏已激活")
+    except Exception as e:
+        log.warning("dxcam 初始化失败: %s，回退到 GDI BitBlt", e)
+        print(f"[后端] dxcam 不可用，使用 GDI 截屏")
+    return _USE_DXCAM
+
+
+def _random_title():
+    """生成无特征窗口标题，避免被 EnumWindows 关键词扫描命中"""
+    words = ["Settings", "Preferences", "System", "Service",
+             "Monitor", "Viewer", "Update", "Config"]
+    return random.choice(words) + " " + "".join(random.choices(string.digits, k=4))
+
+
+_WINDOW_TITLE = _random_title()
 
 
 # ====================================================
@@ -126,30 +235,13 @@ MOUSEEVENTF_ABSOLUTE = 0x8000
 KEYEVENTF_KEYUP = 0x0002
 SRCCOPY = 0x00CC0020
 
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
 VK_F6 = 0x75
 VK_F7 = 0x76
 VK_ESCAPE = 0x1B
 
-HOOKPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_long, ctypes.c_int,
-    ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
-
 # ====================================================
 # Win32 结构体
 # ====================================================
-
-
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", ctypes.wintypes.DWORD),
-        ("scanCode", ctypes.wintypes.DWORD),
-        ("flags", ctypes.wintypes.DWORD),
-        ("time", ctypes.wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -210,24 +302,10 @@ _kernel32 = ctypes.windll.kernel32
 _SendInput = _user32.SendInput
 _SetCursorPos = _user32.SetCursorPos
 _GetCursorPos = _user32.GetCursorPos
-_GetMessageW = _user32.GetMessageW
 
-_SetWindowsHookExW = _user32.SetWindowsHookExW
-_SetWindowsHookExW.restype = ctypes.wintypes.HHOOK
-_SetWindowsHookExW.argtypes = [
-    ctypes.c_int, HOOKPROC, ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD]
-
-_CallNextHookEx = _user32.CallNextHookEx
-_CallNextHookEx.restype = ctypes.c_long
-_CallNextHookEx.argtypes = [
-    ctypes.wintypes.HHOOK, ctypes.c_int,
-    ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
-
-_UnhookWindowsHookEx = _user32.UnhookWindowsHookEx
-
-_GetModuleHandleW = _kernel32.GetModuleHandleW
-_GetModuleHandleW.restype = ctypes.wintypes.HMODULE
-_GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+_GetAsyncKeyState = _user32.GetAsyncKeyState
+_GetAsyncKeyState.restype = ctypes.c_short
+_GetAsyncKeyState.argtypes = [ctypes.c_int]
 
 _screen_w = _user32.GetSystemMetrics(0)
 _screen_h = _user32.GetSystemMetrics(1)
@@ -261,12 +339,22 @@ def _to_abs(x, y):
 
 
 def win32_move(x, y):
+    if _USE_INTERCEPTION:
+        _icp.move_to(x, y)
+        return
     ax, ay = _to_abs(x, y)
     inp = _make_mouse_input(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
     _SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
 def win32_click(x, y):
+    if _USE_INTERCEPTION:
+        _icp.move_to(x, y)
+        time.sleep(random.uniform(0.01, 0.03))
+        _icp.mouse_down('left')
+        time.sleep(random.uniform(0.05, 0.12))
+        _icp.mouse_up('left')
+        return
     # 先移动到目标位置
     win32_move(x, y)
     time.sleep(random.uniform(0.01, 0.03))
@@ -295,8 +383,15 @@ KEYEVENTF_SCANCODE = 0x0008
 
 
 def win32_key_press(vk_code):
-    """模拟按下并松开一个键（走硬件扫描码通道）"""
+    """模拟按下并松开一个键"""
     scan = _MapVirtualKeyW(vk_code, 0)
+
+    if _USE_INTERCEPTION:
+        _icp.key_down(scan)
+        time.sleep(random.uniform(0.04, 0.10))
+        _icp.key_up(scan)
+        return
+
     extra = ctypes.cast(
         _GetMessageExtraInfo(), ctypes.POINTER(ctypes.c_ulong))
 
@@ -386,12 +481,22 @@ def human_click(x, y, offset=CLICK_OFFSET):
 
 
 def capture_region(x1, y1, x2, y2):
-    """用 GDI BitBlt 截取屏幕局部区域，返回 BGR numpy 数组"""
+    """截取屏幕局部区域，返回 BGR numpy 数组（优先 DXGI，回退 GDI）"""
     w = x2 - x1
     h = y2 - y1
     if w <= 0 or h <= 0:
         return None
 
+    # ---- DXGI Desktop Duplication（不走 GDI，更难被拦截） ----
+    if _USE_DXCAM and _dxcam_camera is not None:
+        for _ in range(3):
+            frame = _dxcam_camera.grab(region=(x1, y1, x2, y2))
+            if frame is not None:
+                return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            time.sleep(0.02)
+        # DXGI 连续失败，本次回退 GDI
+
+    # ---- GDI BitBlt 回退 ----
     hdc_screen = _user32.GetDC(0)
     hdc_mem = _gdi32.CreateCompatibleDC(hdc_screen)
     hbmp = _gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
@@ -587,10 +692,14 @@ class AutoBattle:
     def start(self):
         self.running = True
         self.paused = False
+        # 延迟初始化后端（此时用户已有鼠标/键盘操作）
+        _init_interception()
+        _init_dxcam()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         print("[启动] 自动战斗运行中  |  F6 暂停/恢复  F7 重选  Esc 退出")
-        log.info("自动战斗已启动, 区域=%s", self.region)
+        log.info("自动战斗已启动, 区域=%s, interception=%s, dxcam=%s",
+                 self.region, _USE_INTERCEPTION, _USE_DXCAM)
 
     def stop(self):
         self.running = False
@@ -603,9 +712,19 @@ class AutoBattle:
         log.info("切换暂停状态: %s", state)
 
     def _loop(self):
+        cycle = 0
         while self.running:
             if self.paused:
                 time.sleep(0.5)
+                continue
+
+            cycle += 1
+
+            # ---- 抗服务端 AI：模拟玩家偶尔分心 ----
+            if cycle > 5 and random.random() < 0.02:
+                afk = random.uniform(15, 60)
+                log.info("模拟分心，暂停 %.1f 秒", afk)
+                self._interruptible_sleep(afk)
                 continue
 
             try:
@@ -616,6 +735,12 @@ class AutoBattle:
                 time.sleep(2)
                 continue
 
+            # 偶尔检测到了但"犹豫"不操作（~3%）
+            if page != "normal" and random.random() < 0.03:
+                log.debug("模拟犹豫，跳过本次操作")
+                self._interruptible_sleep(random.uniform(1.0, 2.5))
+                continue
+
             if page == "button_page":
                 self._do_click_button(info)
             elif page == "select_hero":
@@ -623,10 +748,14 @@ class AutoBattle:
             else:
                 self._do_idle()
 
-            # 随机检测间隔
-            delay = random.uniform(*DETECTION_INTERVAL)
-            if random.random() < 0.05:
-                delay += random.uniform(1.0, 3.0)
+            # 混合分布检测间隔（比纯均匀分布更像人类）
+            r = random.random()
+            if r < 0.05:
+                delay = random.uniform(5.0, 10.0)    # 偶尔长间隔
+            elif r < 0.15:
+                delay = random.uniform(1.0, 1.5)      # 偶尔快速反应
+            else:
+                delay = random.uniform(*DETECTION_INTERVAL)
             self._interruptible_sleep(delay)
 
     def _do_click_button(self, info):
@@ -700,7 +829,7 @@ class RegionSelector:
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.3)
         self.root.configure(bg="gray")
-        self.root.title("拖拽框选游戏区域")
+        self.root.title(_WINDOW_TITLE)
 
         self.canvas = tk.Canvas(self.root, cursor="cross", bg="gray",
                                 highlightthickness=0)
@@ -743,46 +872,35 @@ class RegionSelector:
 
 
 # ====================================================
-# 低级键盘钩子
+# 按键轮询（替代低级键盘钩子，无系统钩子注册，不可被检测）
 # ====================================================
 
-_hook_handle = None
-_hook_callbacks = {}
-
-
-def _ll_keyboard_proc(nCode, wParam, lParam):
-    if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-        kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-        cb = _hook_callbacks.get(kb.vkCode)
-        if cb is not None:
-            threading.Thread(target=cb, daemon=True).start()
-    return _CallNextHookEx(_hook_handle, nCode, wParam, lParam)
-
-
-_proc_ref = HOOKPROC(_ll_keyboard_proc)
-
-
-def install_keyboard_hook():
-    global _hook_handle
-    hmod = _GetModuleHandleW("user32")
-    if not hmod:
-        hmod = _GetModuleHandleW(None)
-    _hook_handle = _SetWindowsHookExW(WH_KEYBOARD_LL, _proc_ref, hmod, 0)
-    if not _hook_handle:
-        err = ctypes.get_last_error() or _kernel32.GetLastError()
-        log.error("键盘钩子安装失败, 错误码=%s", err)
-        raise RuntimeError(f"SetWindowsHookEx 失败 (错误码={err})")
-    log.info("键盘钩子安装成功")
-
-
-def pump_messages():
-    msg = ctypes.wintypes.MSG()
-    while _GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-        pass
+_hotkey_callbacks = {}
+_hotkey_running = False
 
 
 def register_hotkey(vk_code, callback):
-    _hook_callbacks[vk_code] = callback
+    _hotkey_callbacks[vk_code] = callback
+
+
+def _poll_keys():
+    """后台轮询线程：通过 GetAsyncKeyState 检测按键状态"""
+    prev_state = {}
+    while _hotkey_running:
+        for vk, cb in list(_hotkey_callbacks.items()):
+            pressed = bool(_GetAsyncKeyState(vk) & 0x8000)
+            if pressed and not prev_state.get(vk, False):
+                threading.Thread(target=cb, daemon=True).start()
+            prev_state[vk] = pressed
+        time.sleep(0.015)  # ~66Hz 轮询频率
+
+
+def start_hotkey_polling():
+    global _hotkey_running
+    _hotkey_running = True
+    t = threading.Thread(target=_poll_keys, daemon=True)
+    t.start()
+    log.info("按键轮询已启动")
 
 
 # ====================================================
@@ -808,7 +926,7 @@ class ControlPanel:
         self.region = None
         self.state = "idle"       # idle | running | paused | selecting
 
-        root.title("Auto Battle")
+        root.title(_WINDOW_TITLE)
         root.geometry("320x390")
         root.resizable(False, False)
         root.attributes("-topmost", True)
@@ -1029,11 +1147,7 @@ def main():
     register_hotkey(VK_F6, lambda: root.after(0, panel.on_pause_resume))
     register_hotkey(VK_F7, lambda: root.after(0, panel.on_select_region))
     register_hotkey(VK_ESCAPE, lambda: root.after(0, panel.on_quit))
-    install_keyboard_hook()
-
-    # 消息泵在后台线程运行（低级键盘钩子需要）
-    msg_thread = threading.Thread(target=pump_messages, daemon=True)
-    msg_thread.start()
+    start_hotkey_polling()
 
     root.mainloop()
 

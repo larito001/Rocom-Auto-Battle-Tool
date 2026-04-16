@@ -38,6 +38,9 @@ htmlcov/
 # pyenv
 # .python-version
 
+### Tools (driver installers)
+tools/
+
 ### Windows
 # Windows thumbnail cache files
 Thumbs.db

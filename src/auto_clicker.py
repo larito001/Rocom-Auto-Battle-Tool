@@ -13,11 +13,63 @@ import logging
 import math
 import os
 import random
+import string
 import sys
 import threading
 import time
 import traceback
 import tkinter as tk
+from tkinter import messagebox
+
+
+# ====================================================
+# 依赖检查（在提权前执行，缺少则弹窗并禁止启动）
+# ====================================================
+
+def _check_dependencies():
+    """检测所有必需第三方依赖，未安装则弹窗列出并退出"""
+    missing = []
+    checks = [
+        ('interception',  'interception-python'),
+        ('win32api',      'pywin32'),
+    ]
+    for mod, pip_name in checks:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pip_name)
+
+    if missing:
+        root = tk.Tk()
+        root.withdraw()
+        msg = "以下依赖未安装，程序无法启动：\n\n"
+        for pkg in missing:
+            msg += f"  ● {pkg}\n"
+        msg += f"\n请在命令行运行以下命令安装：\n\npip install {' '.join(missing)}"
+        messagebox.showerror("依赖缺失", msg)
+        root.destroy()
+        sys.exit(1)
+
+    # Interception 驱动检查（非阻塞，仅警告）
+    import ctypes as _ct
+    _h = _ct.windll.kernel32.CreateFileA(
+        br'\\.\interception00', 0x80000000, 0, 0, 3, 0, 0)
+    if _h == -1 or _h == 0xFFFFFFFF:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "Interception 驱动未安装",
+            "Interception 驱动未安装或未生效（需重启电脑）。\n\n"
+            "当前将回退到 SendInput（带注入标志，可被检测）。\n\n"
+            "安装方法：\n"
+            "1. 运行 install-interception.exe /install\n"
+            "2. 重启电脑")
+        root.destroy()
+    else:
+        _ct.windll.kernel32.CloseHandle(_h)
+
+
+_check_dependencies()
 
 # ====================================================
 # 自动提权为管理员（解决 UIPI 阻止 SendInput）
@@ -75,6 +127,14 @@ except Exception:
         pass
 
 # ====================================================
+# 可选后端：Interception 驱动（输入）
+# ====================================================
+
+import interception as _icp
+
+_USE_INTERCEPTION = False
+
+# ====================================================
 # 日志
 # ====================================================
 
@@ -95,12 +155,40 @@ log.addHandler(_fh)
 
 log.info("=" * 40)
 log.info("脚本启动，管理员权限=%s", _is_admin())
+log.info("依赖检查通过，后端就绪: interception")
 
 # ---------- 配置 ----------
 MIN_INTERVAL = 1.1   # 最小点击间隔（秒）
 MAX_INTERVAL = 1.5   # 最大点击间隔（秒）
 MOUSE_MOVE_STEPS = 15  # 鼠标移动插值步数（越大越平滑）
 # ---------------------------
+
+
+def _init_interception():
+    """延迟初始化 Interception 驱动（在用户首次操作鼠标后调用）"""
+    global _USE_INTERCEPTION
+    if _USE_INTERCEPTION:
+        return True
+    try:
+        _icp.auto_capture_devices(keyboard=False, mouse=True)
+        _USE_INTERCEPTION = True
+        log.info("Interception 驱动初始化成功 — 输入无 INJECTED 标志")
+        print("[后端] Interception 驱动已激活")
+    except Exception as e:
+        log.warning("Interception 初始化失败: %s，回退到 SendInput", e)
+        print(f"[后端] Interception 不可用，使用 SendInput")
+    return _USE_INTERCEPTION
+
+
+def _random_title():
+    """生成无特征窗口标题"""
+    words = ["Settings", "Preferences", "System", "Service",
+             "Monitor", "Viewer", "Update", "Config"]
+    return random.choice(words) + " " + "".join(random.choices(string.digits, k=4))
+
+
+_WINDOW_TITLE = _random_title()
+
 
 # ====================================================
 # 用 Win32 API (SendInput) 直接发送输入事件
@@ -113,31 +201,9 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_ABSOLUTE = 0x8000
 
-# 低级键盘钩子常量
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
 VK_F6 = 0x75
 VK_F7 = 0x76
 VK_ESCAPE = 0x1B
-
-# 回调类型
-HOOKPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_long,                 # LRESULT
-    ctypes.c_int,                  # nCode
-    ctypes.wintypes.WPARAM,        # wParam
-    ctypes.wintypes.LPARAM,        # lParam
-)
-
-
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", ctypes.wintypes.DWORD),
-        ("scanCode", ctypes.wintypes.DWORD),
-        ("flags", ctypes.wintypes.DWORD),
-        ("time", ctypes.wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -165,24 +231,10 @@ _user32 = ctypes.windll.user32
 _SendInput = _user32.SendInput
 _SetCursorPos = _user32.SetCursorPos
 _GetCursorPos = _user32.GetCursorPos
-_GetMessageW = _user32.GetMessageW
 
-_SetWindowsHookExW = _user32.SetWindowsHookExW
-_SetWindowsHookExW.restype = ctypes.wintypes.HHOOK
-_SetWindowsHookExW.argtypes = [
-    ctypes.c_int, HOOKPROC, ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD]
-
-_CallNextHookEx = _user32.CallNextHookEx
-_CallNextHookEx.restype = ctypes.c_long
-_CallNextHookEx.argtypes = [
-    ctypes.wintypes.HHOOK, ctypes.c_int,
-    ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
-
-_UnhookWindowsHookEx = _user32.UnhookWindowsHookEx
-
-_GetModuleHandleW = ctypes.windll.kernel32.GetModuleHandleW
-_GetModuleHandleW.restype = ctypes.wintypes.HMODULE
-_GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+_GetAsyncKeyState = _user32.GetAsyncKeyState
+_GetAsyncKeyState.restype = ctypes.c_short
+_GetAsyncKeyState.argtypes = [ctypes.c_int]
 
 _screen_w = _user32.GetSystemMetrics(0)
 _screen_h = _user32.GetSystemMetrics(1)
@@ -215,12 +267,22 @@ def _to_abs(x, y):
 
 
 def win32_move(x, y):
+    if _USE_INTERCEPTION:
+        _icp.move_to(x, y)
+        return
     ax, ay = _to_abs(x, y)
     inp = _make_mouse_input(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
     _SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
 def win32_click(x, y):
+    if _USE_INTERCEPTION:
+        _icp.move_to(x, y)
+        time.sleep(random.uniform(0.01, 0.03))
+        _icp.mouse_down('left')
+        time.sleep(random.uniform(0.05, 0.12))
+        _icp.mouse_up('left')
+        return
     # 先移动到目标位置
     win32_move(x, y)
     time.sleep(random.uniform(0.01, 0.03))
@@ -323,7 +385,7 @@ class RegionSelector:
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.3)
         self.root.configure(bg="gray")
-        self.root.title("拖拽框选点击区域 | Esc 取消")
+        self.root.title(_WINDOW_TITLE)
 
         self.canvas = tk.Canvas(self.root, cursor="cross", bg="gray",
                                 highlightthickness=0)
@@ -388,10 +450,12 @@ class Clicker:
             return
         self.running = True
         self.paused = False
+        _init_interception()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
         print("[开始] 自动点击已启动  |  F6 暂停/恢复  F7 重选  Esc 退出")
-        log.info("自动点击已启动, 区域=%s", self.region)
+        log.info("自动点击已启动, 区域=%s, interception=%s",
+                 self.region, _USE_INTERCEPTION)
 
     def stop(self):
         self.running = False
@@ -406,8 +470,20 @@ class Clicker:
     def _loop(self):
         x1, y1, x2, y2 = self.region
         log.debug("点击循环开始, 区域=(%d,%d,%d,%d)", x1, y1, x2, y2)
+        cycle = 0
         while self.running:
             if not self.paused:
+                cycle += 1
+
+                # 模拟玩家偶尔分心（~2%）
+                if cycle > 5 and random.random() < 0.02:
+                    afk = random.uniform(10, 40)
+                    log.info("模拟分心，暂停 %.1f 秒", afk)
+                    end = time.time() + afk
+                    while time.time() < end and self.running:
+                        time.sleep(0.05)
+                    continue
+
                 tx, ty = random_point_in_region(x1, y1, x2, y2)
                 cx, cy = get_cursor_pos()
                 human_move(cx, cy, tx, ty)
@@ -423,53 +499,35 @@ class Clicker:
 
 
 # ====================================================
-# 低级键盘钩子（替代 keyboard 库，游戏聚焦时也能工作）
+# 按键轮询（替代低级键盘钩子，无系统钩子注册，不可被检测）
 # ====================================================
 
-_hook_handle = None
-_hook_callbacks = {}  # vkCode -> callable
-
-
-def _ll_keyboard_proc(nCode, wParam, lParam):
-    """WH_KEYBOARD_LL 回调，在所有窗口之前拦截按键"""
-    if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-        kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-        cb = _hook_callbacks.get(kb.vkCode)
-        if cb is not None:
-            # 在单独线程中执行回调，避免阻塞钩子链
-            threading.Thread(target=cb, daemon=True).start()
-    return _CallNextHookEx(_hook_handle, nCode, wParam, lParam)
-
-
-# 保持对回调的强引用，防止被 GC 回收导致崩溃
-_proc_ref = HOOKPROC(_ll_keyboard_proc)
-
-
-def install_keyboard_hook():
-    """安装全局低级键盘钩子"""
-    global _hook_handle
-    hmod = _GetModuleHandleW("user32")
-    if not hmod:
-        hmod = _GetModuleHandleW(None)
-    _hook_handle = _SetWindowsHookExW(
-        WH_KEYBOARD_LL, _proc_ref,
-        hmod, 0)
-    if not _hook_handle:
-        err = ctypes.get_last_error() or ctypes.windll.kernel32.GetLastError()
-        log.error("键盘钩子安装失败, 错误码=%s", err)
-        raise RuntimeError(f"SetWindowsHookEx 失败 (错误码={err})，请以管理员权限运行")
-    log.info("键盘钩子安装成功")
-
-
-def pump_messages():
-    """消息泵 —— 低级钩子需要消息循环才能工作"""
-    msg = ctypes.wintypes.MSG()
-    while _GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-        pass
+_hotkey_callbacks = {}
+_hotkey_running = False
 
 
 def register_hotkey(vk_code, callback):
-    _hook_callbacks[vk_code] = callback
+    _hotkey_callbacks[vk_code] = callback
+
+
+def _poll_keys():
+    """后台轮询线程：通过 GetAsyncKeyState 检测按键状态"""
+    prev_state = {}
+    while _hotkey_running:
+        for vk, cb in list(_hotkey_callbacks.items()):
+            pressed = bool(_GetAsyncKeyState(vk) & 0x8000)
+            if pressed and not prev_state.get(vk, False):
+                threading.Thread(target=cb, daemon=True).start()
+            prev_state[vk] = pressed
+        time.sleep(0.015)  # ~66Hz 轮询频率
+
+
+def start_hotkey_polling():
+    global _hotkey_running
+    _hotkey_running = True
+    t = threading.Thread(target=_poll_keys, daemon=True)
+    t.start()
+    log.info("按键轮询已启动")
 
 
 # ====================================================
@@ -494,7 +552,7 @@ class ControlPanel:
         self.region = None
         self.state = "idle"       # idle | running | paused | selecting
 
-        root.title("Auto Clicker")
+        root.title(_WINDOW_TITLE)
         root.geometry("320x390")
         root.resizable(False, False)
         root.attributes("-topmost", True)
@@ -707,11 +765,7 @@ def main():
     register_hotkey(VK_F6, lambda: root.after(0, panel.on_pause_resume))
     register_hotkey(VK_F7, lambda: root.after(0, panel.on_select_region))
     register_hotkey(VK_ESCAPE, lambda: root.after(0, panel.on_quit))
-    install_keyboard_hook()
-
-    # 消息泵在后台线程运行（低级键盘钩子需要）
-    msg_thread = threading.Thread(target=pump_messages, daemon=True)
-    msg_thread.start()
+    start_hotkey_polling()
 
     print("=" * 50)
     print("  自动点击器 (UE5 兼容版)")

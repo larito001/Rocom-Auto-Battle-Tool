@@ -6,7 +6,11 @@
       "Bash(mkdir -p src)",
       "Bash(mv auto_battle.py auto_clicker.py Button.jpg SelectHero.jpg buttonPage.jpg selectPage.jpg auto_battle.bat auto_clicker.bat src/)",
       "Bash(python3 *)",
-      "Bash(ls *)"
+      "Bash(ls *)",
+      "WebSearch",
+      "Bash(curl *)",
+      "Bash(C:/Users/20723/Desktop/autoBattle/tools/interception/Interception/command line installer/install-interception.exe *)",
+      "Bash(powershell *)"
     ]
   }
 }
