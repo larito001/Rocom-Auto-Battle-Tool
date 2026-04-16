@@ -19,21 +19,45 @@ def _rand_name():
 
 battle_name = _rand_name()
 
-# 安装 PyInstaller
-subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller", "-q"])
+# 随机版本号，模拟系统组件
+_ver = f"10.0.{random.randint(19041, 26100)}.{random.randint(1, 999)}"
 
-# 打包 auto_battle
-print(f"\n===== 打包 {battle_name}.exe (auto_battle) =====")
+# 文件描述与进程名匹配的说明
+_DESC_MAP = {
+    "svchost": "Host Process for Windows Services",
+    "conhost": "Console Window Host",
+    "dllhost": "COM Surrogate",
+    "sihost": "Shell Infrastructure Host",
+    "ctfmon": "CTF Loader",
+    "taskhostw": "Host Process for Windows Tasks",
+    "smartscreen": "Windows Defender SmartScreen",
+    "fontdrvhost": "Usermode Font Driver Host",
+}
+_prefix = battle_name.split("_")[0]
+_desc = _DESC_MAP.get(_prefix, "Windows System Service")
+
+# 安装 Nuitka 及 ordered-set（加速编译）
+subprocess.run([sys.executable, "-m", "pip", "install", "nuitka", "ordered-set", "-q"])
+
+# 编译（Nuitka → 原生 C，无 Python 运行时解包特征）
+print(f"\n===== 编译 {battle_name}.exe (Nuitka) =====")
 subprocess.run([
-    sys.executable, "-m", "PyInstaller",
-    "--noconfirm", "--onefile", "--windowed",
-    "--name", battle_name,
-    "--uac-admin",
-    "--distpath", BUILD,
-    "--workpath", os.path.join(BUILD, "temp"),
-    "--specpath", os.path.join(BUILD, "temp"),
-    "--add-data", os.path.join(SRC, "Button.jpg") + ";.",
-    "--add-data", os.path.join(SRC, "BattleReport.png") + ";.",
+    sys.executable, "-m", "nuitka",
+    "--onefile",
+    "--windows-disable-console",
+    "--windows-uac-admin",
+    f"--output-filename={battle_name}.exe",
+    f"--output-dir={BUILD}",
+    f"--include-data-files={os.path.join(SRC, 'Button.jpg')}=Button.jpg",
+    f"--include-data-files={os.path.join(SRC, 'BattleReport.png')}=BattleReport.png",
+    "--remove-output",
+    "--assume-yes-for-downloads",
+    # 伪装 Windows 版本信息资源
+    f"--windows-company-name=Microsoft Corporation",
+    f"--windows-product-name=Microsoft Windows Operating System",
+    f"--windows-file-version={_ver}",
+    f"--windows-product-version={_ver}",
+    f"--windows-file-description={_desc}",
     os.path.join(SRC, "auto_battle.py"),
 ])
 

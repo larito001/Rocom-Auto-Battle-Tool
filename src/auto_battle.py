@@ -1,14 +1,4 @@
-"""
-自动战斗脚本 - 识别游戏界面状态并自动操作
-用法：
-  1. 运行脚本（会自动请求管理员权限）
-  2. 用鼠标拖拽框选游戏窗口区域
-  3. 脚本自动识别界面并执行操作：
-     - buttonPage  → 点击左下角灰色星形按钮
-     - selectHero  → 按顺序点击精灵 ⊙ 图标
-     - normal      → 等待
-  4. 按 F6 暂停/恢复，按 F7 重新框选，按 Esc 退出
-"""
+# -*- coding: utf-8 -*-
 
 import ctypes
 import ctypes.wintypes
@@ -35,7 +25,6 @@ def _check_dependencies():
     checks = [
         ('cv2',           'opencv-python'),
         ('numpy',         'numpy'),
-        ('interception',  'interception-python'),
         ('win32api',      'pywin32'),
         ('dxcam',         'dxcam'),
     ]
@@ -56,24 +45,6 @@ def _check_dependencies():
         root.destroy()
         sys.exit(1)
 
-    # Interception 驱动检查（非阻塞，仅警告）
-    import ctypes as _ct
-    _h = _ct.windll.kernel32.CreateFileA(
-        br'\\.\interception00', 0x80000000, 0, 0, 3, 0, 0)
-    if _h == -1 or _h == 0xFFFFFFFF:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showwarning(
-            "Interception 驱动未安装",
-            "Interception 驱动未安装或未生效（需重启电脑）。\n\n"
-            "当前将回退到 SendInput（带注入标志，可被检测）。\n\n"
-            "安装方法：\n"
-            "1. 运行 install-interception.exe /install\n"
-            "2. 重启电脑")
-        root.destroy()
-    else:
-        _ct.windll.kernel32.CloseHandle(_h)
-
 
 _check_dependencies()
 
@@ -91,7 +62,7 @@ def _is_admin():
         return False
 
 
-_FROZEN = getattr(sys, 'frozen', False)
+_FROZEN = getattr(sys, 'frozen', False) or "__compiled__" in globals()
 
 
 def _elevate():
@@ -133,13 +104,11 @@ except Exception:
         pass
 
 # ====================================================
-# 可选后端：Interception 驱动（输入）/ dxcam（截屏）
+# 可选后端：dxcam（截屏）
 # ====================================================
 
-import interception as _icp
 import dxcam as _dxcam_mod
 
-_USE_INTERCEPTION = False
 _USE_DXCAM = False
 _dxcam_camera = None
 
@@ -148,25 +117,30 @@ _dxcam_camera = None
 # ====================================================
 
 if _FROZEN:
-    RESOURCE_DIR = sys._MEIPASS          # 模板图片打包在此
-    RUNTIME_DIR = os.path.dirname(sys.executable)   # 日志/debug 写在 exe 旁边
+    # Nuitka --onefile: 资源解压到临时目录，通过 __compiled__ 判断
+    _meipass = getattr(sys, '_MEIPASS', None)
+    if _meipass:
+        RESOURCE_DIR = _meipass
+    else:
+        # Nuitka: 数据文件与 exe 同目录
+        RESOURCE_DIR = os.path.dirname(sys.executable)
+    RUNTIME_DIR = os.path.dirname(sys.executable)
 else:
     RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
     RUNTIME_DIR = RESOURCE_DIR
 _LOG_DIR = os.path.join(RUNTIME_DIR, ".log")
 os.makedirs(_LOG_DIR, exist_ok=True)
 
-log = logging.getLogger("auto_battle")
-log.setLevel(logging.DEBUG)
+log = logging.getLogger("app")
+log.setLevel(logging.INFO)
 _fh = logging.FileHandler(
-    os.path.join(_LOG_DIR, "auto_battle.log"), encoding="utf-8")
+    os.path.join(_LOG_DIR, "app.log"), encoding="utf-8")
 _fh.setFormatter(logging.Formatter(
     "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 log.addHandler(_fh)
 
 log.info("=" * 40)
-log.info("脚本启动，管理员权限=%s", _is_admin())
-log.info("依赖检查通过，后端就绪: interception + dxcam")
+log.info("启动，admin=%s", _is_admin())
 
 # ====================================================
 # 配置
@@ -176,24 +150,8 @@ CLICK_OFFSET = 5                      # 点击随机偏移像素
 HERO_SELECT_WAIT = (1.5, 2.5)        # 选精灵后等待时间
 BUTTON_TPL_THRESHOLD = 0.7           # 按钮模板匹配阈值
 BATTLE_TPL_THRESHOLD = 0.55          # "战报" 模板匹配阈值
-DEBUG_SAVE = True                    # 是否保存调试截图到 debug/ 文件夹
+DEBUG_SAVE = False                   # 调试模式，开启后保存截图到 debug/
 MOUSE_MOVE_STEPS = 15                # 鼠标移动插值步数
-
-
-def _init_interception():
-    """延迟初始化 Interception 驱动（在用户首次操作鼠标/键盘后调用）"""
-    global _USE_INTERCEPTION
-    if _USE_INTERCEPTION:
-        return True
-    try:
-        _icp.auto_capture_devices(keyboard=True, mouse=True)
-        _USE_INTERCEPTION = True
-        log.info("Interception 驱动初始化成功 — 输入无 INJECTED 标志")
-        print("[后端] Interception 驱动已激活")
-    except Exception as e:
-        log.warning("Interception 初始化失败: %s，回退到 SendInput", e)
-        print(f"[后端] Interception 不可用，使用 SendInput")
-    return _USE_INTERCEPTION
 
 
 def _init_dxcam():
@@ -204,11 +162,9 @@ def _init_dxcam():
     try:
         _dxcam_camera = _dxcam_mod.create()
         _USE_DXCAM = True
-        log.info("dxcam (DXGI) 截屏初始化成功")
-        print("[后端] DXGI 截屏已激活")
+        log.info("cap init ok")
     except Exception as e:
-        log.warning("dxcam 初始化失败: %s，回退到 GDI BitBlt", e)
-        print(f"[后端] dxcam 不可用，使用 GDI 截屏")
+        log.warning("cap init fail: %s", e)
     return _USE_DXCAM
 
 
@@ -238,6 +194,13 @@ SRCCOPY = 0x00CC0020
 VK_F6 = 0x75
 VK_F7 = 0x76
 VK_ESCAPE = 0x1B
+
+# PostMessage 常量（绕过 SendInput 的 INJECTED 标记）
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+MK_LBUTTON = 0x0001
 
 # ====================================================
 # Win32 结构体
@@ -307,8 +270,44 @@ _GetAsyncKeyState = _user32.GetAsyncKeyState
 _GetAsyncKeyState.restype = ctypes.c_short
 _GetAsyncKeyState.argtypes = [ctypes.c_int]
 
+_PostMessageW = _user32.PostMessageW
+_PostMessageW.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint,
+                          ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+_PostMessageW.restype = ctypes.wintypes.BOOL
+
+_ScreenToClient = _user32.ScreenToClient
+
 _screen_w = _user32.GetSystemMetrics(0)
 _screen_h = _user32.GetSystemMetrics(1)
+
+# ====================================================
+# 游戏窗口句柄（PostMessage 目标）
+# ====================================================
+
+_game_hwnd = None
+
+
+def _find_game_hwnd(region):
+    """从框选区域中心点查找游戏窗口句柄"""
+    global _game_hwnd
+    x1, y1, x2, y2 = region
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    # WindowFromPoint 接收 POINT by value，在 x64 上打包为 int64
+    packed = ((cy & 0xFFFFFFFF) << 32) | (cx & 0xFFFFFFFF)
+    _user32.WindowFromPoint.restype = ctypes.wintypes.HWND
+    _user32.WindowFromPoint.argtypes = [ctypes.c_int64]
+    hwnd = _user32.WindowFromPoint(packed)
+    if hwnd:
+        _game_hwnd = hwnd
+        log.info("target hwnd=%s", hwnd)
+    return hwnd
+
+
+def _screen_to_client(hwnd, x, y):
+    """屏幕坐标 → 窗口客户区坐标"""
+    pt = ctypes.wintypes.POINT(x, y)
+    _ScreenToClient(hwnd, ctypes.byref(pt))
+    return pt.x, pt.y
 
 # ====================================================
 # 鼠标输入
@@ -339,31 +338,26 @@ def _to_abs(x, y):
 
 
 def win32_move(x, y):
-    if _USE_INTERCEPTION:
-        _icp.move_to(x, y)
-        return
-    ax, ay = _to_abs(x, y)
-    inp = _make_mouse_input(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
-    _SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+    """移动鼠标（SetCursorPos 不经过 SendInput，无 INJECTED 标记）"""
+    _SetCursorPos(x, y)
 
 
 def win32_click(x, y):
-    if _USE_INTERCEPTION:
-        _icp.move_to(x, y)
-        time.sleep(random.uniform(0.01, 0.03))
-        _icp.mouse_down('left')
-        time.sleep(random.uniform(0.05, 0.12))
-        _icp.mouse_up('left')
-        return
-    # 先移动到目标位置
+    """点击：优先 PostMessage（无 INJECTED），回退 SendInput"""
     win32_move(x, y)
     time.sleep(random.uniform(0.01, 0.03))
-    # 再单独发送按下/松开（不捆绑 MOVE|ABSOLUTE 标志）
-    down = _make_mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN)
-    up = _make_mouse_input(0, 0, MOUSEEVENTF_LEFTUP)
-    _SendInput(1, ctypes.byref(down), ctypes.sizeof(down))
-    time.sleep(random.uniform(0.05, 0.12))
-    _SendInput(1, ctypes.byref(up), ctypes.sizeof(up))
+    if _game_hwnd:
+        cx, cy = _screen_to_client(_game_hwnd, x, y)
+        lp = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
+        _PostMessageW(_game_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp)
+        time.sleep(random.uniform(0.05, 0.12))
+        _PostMessageW(_game_hwnd, WM_LBUTTONUP, 0, lp)
+    else:
+        down = _make_mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN)
+        up = _make_mouse_input(0, 0, MOUSEEVENTF_LEFTUP)
+        _SendInput(1, ctypes.byref(down), ctypes.sizeof(down))
+        time.sleep(random.uniform(0.05, 0.12))
+        _SendInput(1, ctypes.byref(up), ctypes.sizeof(up))
 
 
 def get_cursor_pos():
@@ -382,50 +376,39 @@ _MapVirtualKeyW = _user32.MapVirtualKeyW
 KEYEVENTF_SCANCODE = 0x0008
 
 
-# VK 码 → interception-python 键名映射
-_VK_TO_KEYNAME = {
-    0x20: 'space',
-    0x30: '0', 0x31: '1', 0x32: '2', 0x33: '3', 0x34: '4',
-    0x35: '5', 0x36: '6', 0x37: '7', 0x38: '8', 0x39: '9',
-}
-
-
 def win32_key_press(vk_code):
-    """模拟按下并松开一个键"""
-    if _USE_INTERCEPTION:
-        key_name = _VK_TO_KEYNAME.get(vk_code)
-        if key_name:
-            _icp.key_down(key_name, delay=random.uniform(0.04, 0.10))
-            _icp.key_up(key_name)
-            return
-        # 未映射的键回退 SendInput
-        log.debug("VK 0x%02X 无 Interception 键名映射，回退 SendInput", vk_code)
-
+    """按键：优先 PostMessage（无 INJECTED），回退 SendInput 扫描码"""
     scan = _MapVirtualKeyW(vk_code, 0)
-    extra = ctypes.cast(
-        _GetMessageExtraInfo(), ctypes.POINTER(ctypes.c_ulong))
 
-    down = INPUT()
-    down.type = INPUT_KEYBOARD
-    down.ki = KEYBDINPUT()
-    down.ki.wVk = 0
-    down.ki.wScan = scan
-    down.ki.dwFlags = KEYEVENTF_SCANCODE
-    down.ki.time = 0
-    down.ki.dwExtraInfo = extra
-
-    up = INPUT()
-    up.type = INPUT_KEYBOARD
-    up.ki = KEYBDINPUT()
-    up.ki.wVk = 0
-    up.ki.wScan = scan
-    up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
-    up.ki.time = 0
-    up.ki.dwExtraInfo = extra
-
-    _SendInput(1, ctypes.byref(down), ctypes.sizeof(down))
-    time.sleep(random.uniform(0.04, 0.10))
-    _SendInput(1, ctypes.byref(up), ctypes.sizeof(up))
+    if _game_hwnd:
+        # lParam: repeat=1, scancode, extended=0, context=0, previous/transition
+        lp_down = 1 | (scan << 16)
+        lp_up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+        _PostMessageW(_game_hwnd, WM_KEYDOWN, vk_code, lp_down)
+        time.sleep(random.uniform(0.04, 0.10))
+        _PostMessageW(_game_hwnd, WM_KEYUP, vk_code, lp_up)
+    else:
+        extra = ctypes.cast(
+            _GetMessageExtraInfo(), ctypes.POINTER(ctypes.c_ulong))
+        down = INPUT()
+        down.type = INPUT_KEYBOARD
+        down.ki = KEYBDINPUT()
+        down.ki.wVk = 0
+        down.ki.wScan = scan
+        down.ki.dwFlags = KEYEVENTF_SCANCODE
+        down.ki.time = 0
+        down.ki.dwExtraInfo = extra
+        up = INPUT()
+        up.type = INPUT_KEYBOARD
+        up.ki = KEYBDINPUT()
+        up.ki.wVk = 0
+        up.ki.wScan = scan
+        up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+        up.ki.time = 0
+        up.ki.dwExtraInfo = extra
+        _SendInput(1, ctypes.byref(down), ctypes.sizeof(down))
+        time.sleep(random.uniform(0.04, 0.10))
+        _SendInput(1, ctypes.byref(up), ctypes.sizeof(up))
 
 
 # ====================================================
@@ -494,63 +477,22 @@ _dxcam_fail_count = 0          # 连续 dxcam 超时/失败计数
 _DXCAM_MAX_FAILS = 3           # 连续失败 N 次后自动禁用 dxcam
 
 
-def capture_region(x1, y1, x2, y2):
-    """截取屏幕局部区域，返回 BGR numpy 数组（优先 DXGI，回退 GDI）"""
-    global _USE_DXCAM, _dxcam_fail_count
-    w = x2 - x1
-    h = y2 - y1
-    if w <= 0 or h <= 0:
-        return None
-
-    # ---- DXGI Desktop Duplication（不走 GDI，更难被拦截） ----
-    if _USE_DXCAM and _dxcam_camera is not None:
-        result = [None]
-
-        def _grab():
-            try:
-                for _ in range(3):
-                    f = _dxcam_camera.grab(region=(x1, y1, x2, y2))
-                    if f is not None:
-                        result[0] = f
-                        return
-                    time.sleep(0.02)
-            except Exception:
-                pass
-
-        t = threading.Thread(target=_grab, daemon=True)
-        t.start()
-        t.join(timeout=2)               # 最多等 2 秒
-
-        if result[0] is not None:
-            _dxcam_fail_count = 0
-            return cv2.cvtColor(result[0], cv2.COLOR_RGB2BGR)
-
-        # dxcam 超时或返回空帧
-        _dxcam_fail_count += 1
-        if _dxcam_fail_count >= _DXCAM_MAX_FAILS:
-            log.warning("dxcam 连续 %d 次失败，自动禁用，后续使用 GDI",
-                        _dxcam_fail_count)
-            print("[后端] dxcam 连续失败，已切换到 GDI 截屏")
-            _USE_DXCAM = False
-        else:
-            log.debug("dxcam 第 %d 次失败/超时，本次回退 GDI",
-                      _dxcam_fail_count)
-
-    # ---- GDI BitBlt 回退 ----
-    hdc_screen = _user32.GetDC(0)
-    hdc_mem = _gdi32.CreateCompatibleDC(hdc_screen)
-    hbmp = _gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+def _capture_gdi(x1, y1, w, h):
+    """GDI BitBlt 截屏（通用，不易被针对性拦截）"""
+    hdc_src = _user32.GetDC(0)
+    hdc_mem = _gdi32.CreateCompatibleDC(hdc_src)
+    hbmp = _gdi32.CreateCompatibleBitmap(hdc_src, w, h)
     old = _gdi32.SelectObject(hdc_mem, hbmp)
 
-    _gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x1, y1, SRCCOPY)
+    _gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_src, x1, y1, SRCCOPY)
 
     bmi = BITMAPINFOHEADER()
     bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
     bmi.biWidth = w
-    bmi.biHeight = -h          # 自顶向下
+    bmi.biHeight = -h
     bmi.biPlanes = 1
     bmi.biBitCount = 32
-    bmi.biCompression = 0      # BI_RGB
+    bmi.biCompression = 0
 
     buf = ctypes.create_string_buffer(w * h * 4)
     _gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bmi), 0)
@@ -558,10 +500,58 @@ def capture_region(x1, y1, x2, y2):
     _gdi32.SelectObject(hdc_mem, old)
     _gdi32.DeleteObject(hbmp)
     _gdi32.DeleteDC(hdc_mem)
-    _user32.ReleaseDC(0, hdc_screen)
+    _user32.ReleaseDC(0, hdc_src)
 
     img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
-    return img[:, :, :3].copy()     # BGRA → BGR
+    return img[:, :, :3].copy()
+
+
+def _capture_dxcam(x1, y1, x2, y2):
+    """DXGI Desktop Duplication 截屏（备选）"""
+    result = [None]
+
+    def _grab():
+        try:
+            for _ in range(3):
+                f = _dxcam_camera.grab(region=(x1, y1, x2, y2))
+                if f is not None:
+                    result[0] = f
+                    return
+                time.sleep(0.02)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_grab, daemon=True)
+    t.start()
+    t.join(timeout=2)
+
+    if result[0] is not None:
+        return cv2.cvtColor(result[0], cv2.COLOR_RGB2BGR)
+    return None
+
+
+def capture_region(x1, y1, x2, y2):
+    """截取屏幕局部区域，返回 BGR numpy 数组。
+    默认 GDI（常见合法调用，不易触发检测），随机穿插 DXGI 避免单一 API 特征。"""
+    global _USE_DXCAM, _dxcam_fail_count
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return None
+
+    # 20% 概率使用 DXGI（如果可用），降低 DXGI 接口的持续调用特征
+    use_dx = _USE_DXCAM and _dxcam_camera is not None and random.random() < 0.20
+    if use_dx:
+        frame = _capture_dxcam(x1, y1, x2, y2)
+        if frame is not None:
+            _dxcam_fail_count = 0
+            return frame
+        _dxcam_fail_count += 1
+        if _dxcam_fail_count >= _DXCAM_MAX_FAILS:
+            log.warning("cap fallback after %d fails", _dxcam_fail_count)
+            _USE_DXCAM = False
+
+    return _capture_gdi(x1, y1, w, h)
 
 
 # ====================================================
@@ -711,7 +701,7 @@ class PageDetector:
 
 
 # ====================================================
-# 自动战斗核心
+# 核心循环
 # ====================================================
 
 
@@ -722,22 +712,36 @@ class AutoBattle:
         self.running = True
         self.paused = False
         self._thread = None
+        # ---- 行为仿真参数 ----
+        self._start_time = time.time()
+        # 会话节奏：每次启动随机决定是"快手"还是"慢手"玩家
+        self._tempo = random.uniform(0.75, 1.35)
+        # 下次定时休息的周期（分钟）
+        self._next_break_min = random.uniform(12, 35)
+
+    def _fatigue_factor(self):
+        """疲劳系数：随时间推移反应变慢（1.0 → 1.3，约 2 小时封顶）"""
+        elapsed = time.time() - self._start_time
+        return 1.0 + 0.3 * min(1.0, elapsed / 7200)
+
+    def _adjusted_delay(self, base_delay):
+        """综合节奏 + 疲劳后的实际延迟"""
+        return base_delay * self._tempo * self._fatigue_factor()
 
     def start(self):
         self.running = True
         self.paused = False
-        # 延迟初始化后端（此时用户已有鼠标/键盘操作）
-        _init_interception()
+        _find_game_hwnd(self.region)
         _init_dxcam()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        print("[启动] 自动战斗运行中  |  F6 暂停/恢复  F7 重选  Esc 退出")
-        log.info("自动战斗已启动, 区域=%s, interception=%s, dxcam=%s",
-                 self.region, _USE_INTERCEPTION, _USE_DXCAM)
+        print("[启动] 运行中  |  F6 暂停/恢复  F7 重选  Esc 退出")
+        log.info("已启动, 区域=%s, dxcam=%s, hwnd=%s",
+                 self.region, _USE_DXCAM, _game_hwnd)
 
     def stop(self):
         self.running = False
-        log.info("自动战斗已停止")
+        log.info("stopped")
 
     def toggle_pause(self):
         self.paused = not self.paused
@@ -754,36 +758,47 @@ class AutoBattle:
 
             cycle += 1
 
-            # ---- 抗服务端 AI：模拟玩家偶尔分心 ----
-            if cycle > 5 and random.random() < 0.02:
-                afk = random.uniform(15, 60)
-                log.info("模拟分心，暂停 %.1f 秒", afk)
+            # ---- 定时休息（模拟玩家去上厕所/喝水） ----
+            elapsed_min = (time.time() - self._start_time) / 60
+            if elapsed_min >= self._next_break_min:
+                rest = random.uniform(30, 120)
+                log.info("scheduled break %.0fs", rest)
+                self._interruptible_sleep(rest)
+                self._next_break_min = elapsed_min + random.uniform(12, 35)
+                continue
+
+            # ---- 随机分心（概率随疲劳递增） ----
+            afk_prob = 0.015 * self._fatigue_factor()
+            if cycle > 5 and random.random() < afk_prob:
+                afk = random.uniform(10, 45)
+                log.info("afk %.1fs", afk)
                 self._interruptible_sleep(afk)
                 continue
 
-            # 带超时检测（防止 dxcam 截屏阻塞）
+            # 带超时检测
             detect_result = [None]
 
             def _detect_main():
                 try:
                     detect_result[0] = self.detector.detect(self.region)
                 except Exception as e:
-                    log.exception("界面检测异常: %s", e)
+                    log.exception("detect err: %s", e)
 
             dt = threading.Thread(target=_detect_main, daemon=True)
             dt.start()
             dt.join(timeout=8)
 
             if detect_result[0] is None:
-                log.warning("主循环 detect() 超时或异常，跳过本次")
+                log.warning("detect timeout")
                 continue
 
             page, info = detect_result[0]
 
-            # 偶尔检测到了但"犹豫"不操作（~3%）
-            if page != "normal" and random.random() < 0.03:
-                log.debug("模拟犹豫，跳过本次操作")
-                self._interruptible_sleep(random.uniform(1.0, 2.5))
+            # 犹豫概率随疲劳递增（2%-5%）
+            hesitate_prob = 0.02 * self._fatigue_factor()
+            if page != "normal" and random.random() < hesitate_prob:
+                self._interruptible_sleep(
+                    self._adjusted_delay(random.uniform(0.8, 2.0)))
                 continue
 
             if page == "button_page":
@@ -793,21 +808,29 @@ class AutoBattle:
             else:
                 self._do_idle()
 
-            # 混合分布检测间隔（比纯均匀分布更像人类）
+            # 混合分布检测间隔 × 节奏 × 疲劳
             r = random.random()
             if r < 0.05:
-                delay = random.uniform(5.0, 10.0)    # 偶尔长间隔
+                delay = random.uniform(5.0, 10.0)
             elif r < 0.15:
-                delay = random.uniform(1.0, 1.5)      # 偶尔快速反应
+                delay = random.uniform(1.0, 1.5)
             else:
                 delay = random.uniform(*DETECTION_INTERVAL)
-            self._interruptible_sleep(delay)
+            self._interruptible_sleep(self._adjusted_delay(delay))
 
     def _do_click_button(self, info):
         sx, sy = info["click"]
         conf = info["conf"]
-        print(f"[buttonPage] 点击星形按钮 ({sx}, {sy})  置信度={conf:.2f}")
-        log.info("点击星形按钮 (%d,%d) 置信度=%.2f", sx, sy, conf)
+        print(f"[buttonPage] ({sx}, {sy})  conf={conf:.2f}")
+        log.info("btn (%d,%d) c=%.2f", sx, sy, conf)
+
+        # ~5% 概率微失误：先点偏，再修正（模拟手滑）
+        if random.random() < 0.05:
+            miss_x = sx + random.randint(-25, 25)
+            miss_y = sy + random.randint(-25, 25)
+            human_click(miss_x, miss_y)
+            time.sleep(random.uniform(0.3, 0.8))
+
         human_click(sx, sy)
 
     def _do_select_hero(self, info):
@@ -951,7 +974,7 @@ def register_hotkey(vk_code, callback):
 
 
 def _poll_keys():
-    """后台轮询线程：通过 GetAsyncKeyState 检测按键状态"""
+    """后台轮询线程：通过 GetAsyncKeyState 检测按键状态（随机间隔避免固定频率特征）"""
     prev_state = {}
     while _hotkey_running:
         for vk, cb in list(_hotkey_callbacks.items()):
@@ -959,7 +982,7 @@ def _poll_keys():
             if pressed and not prev_state.get(vk, False):
                 threading.Thread(target=cb, daemon=True).start()
             prev_state[vk] = pressed
-        time.sleep(0.015)  # ~66Hz 轮询频率
+        time.sleep(random.uniform(0.010, 0.035))
 
 
 def start_hotkey_polling():
@@ -1008,19 +1031,17 @@ class ControlPanel:
 
         # ---- 标题 ----
         tk.Label(
-            root, text="Auto Battle",
+            root, text=_WINDOW_TITLE,
             font=("Microsoft YaHei", 14, "bold"),
             bg=self.BG, fg=self.ACCENT
         ).grid(row=0, column=0, padx=14, pady=(12, 2), sticky="w")
 
-        # ---- TIPS 区域 (红色醒目) ----
+        # ---- TIPS 区域 ----
         tips_frame = tk.Frame(root, bg=self.BG)
         tips_frame.grid(row=1, column=0, padx=14, pady=(0, 8), sticky="w")
         for line in [
-            "TIPS: 请使用游戏分辨率 1176 x 664",
-            "企鹅: 275899142",
-            "非商业售卖，仅供学习娱乐",
-            "最终解释权归开发者 Larito 所有",
+            "Resolution: 1176 x 664",
+            "QQ: 275899142",
         ]:
             tk.Label(tips_frame, text=line,
                      font=("Microsoft YaHei", 8, "bold"),
@@ -1199,12 +1220,8 @@ class ControlPanel:
 
 def main():
     print("=" * 50)
-    print("  自动战斗脚本 (界面识别版)")
-    print("  已以管理员权限运行")
+    print("  Ready")
     print("=" * 50)
-
-    # 加载模板
-    print("[初始化] 加载模板图片...")
     detector = PageDetector()
 
     root = tk.Tk()
