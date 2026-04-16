@@ -25,7 +25,6 @@ def _check_dependencies():
     checks = [
         ('cv2',           'opencv-python'),
         ('numpy',         'numpy'),
-        ('win32api',      'pywin32'),
         ('dxcam',         'dxcam'),
     ]
     for mod, pip_name in checks:
@@ -198,6 +197,7 @@ VK_ESCAPE = 0x1B
 # PostMessage 常量（绕过 SendInput 的 INJECTED 标记）
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
+WM_CHAR = 0x0102
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 MK_LBUTTON = 0x0001
@@ -284,23 +284,52 @@ _screen_h = _user32.GetSystemMetrics(1)
 # 游戏窗口句柄（PostMessage 目标）
 # ====================================================
 
-_game_hwnd = None
+_game_hwnd = None       # 顶层窗口（鼠标消息目标）
+_game_key_hwnd = None   # 键盘焦点子窗口
+
+
+_GetWindowThreadProcessId = _user32.GetWindowThreadProcessId
+_GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+_AttachThreadInput = _user32.AttachThreadInput
+_GetFocus = _user32.GetFocus
+_GetFocus.restype = ctypes.wintypes.HWND
+_SetForegroundWindow = _user32.SetForegroundWindow
+_GetCurrentThreadId = _kernel32.GetCurrentThreadId
+_GetCurrentThreadId.restype = ctypes.wintypes.DWORD
 
 
 def _find_game_hwnd(region):
-    """从框选区域中心点查找游戏窗口句柄"""
-    global _game_hwnd
+    """从框选区域中心点查找游戏窗口句柄及键盘焦点子窗口"""
+    global _game_hwnd, _game_key_hwnd
     x1, y1, x2, y2 = region
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    # WindowFromPoint 接收 POINT by value，在 x64 上打包为 int64
     packed = ((cy & 0xFFFFFFFF) << 32) | (cx & 0xFFFFFFFF)
     _user32.WindowFromPoint.restype = ctypes.wintypes.HWND
     _user32.WindowFromPoint.argtypes = [ctypes.c_int64]
     hwnd = _user32.WindowFromPoint(packed)
     if hwnd:
         _game_hwnd = hwnd
-        log.info("target hwnd=%s", hwnd)
+        # 找到游戏线程的键盘焦点子窗口
+        _game_key_hwnd = _get_focus_child(hwnd)
+        log.info("target hwnd=%s key_hwnd=%s", hwnd, _game_key_hwnd)
     return hwnd
+
+
+def _get_focus_child(hwnd):
+    """获取目标窗口线程中实际拥有键盘焦点的子窗口"""
+    tid = _GetWindowThreadProcessId(hwnd, None)
+    my_tid = _GetCurrentThreadId()
+    if tid == 0 or tid == my_tid:
+        return hwnd
+    # 临时附加到游戏线程以获取其焦点窗口
+    _AttachThreadInput(my_tid, tid, True)
+    try:
+        _SetForegroundWindow(hwnd)
+        time.sleep(0.05)
+        focused = _GetFocus()
+        return focused if focused else hwnd
+    finally:
+        _AttachThreadInput(my_tid, tid, False)
 
 
 def _screen_to_client(hwnd, x, y):
@@ -377,16 +406,25 @@ KEYEVENTF_SCANCODE = 0x0008
 
 
 def win32_key_press(vk_code):
-    """按键：优先 PostMessage（无 INJECTED），回退 SendInput 扫描码"""
+    """按键：PostMessage 到焦点子窗口（WM_KEYDOWN + WM_CHAR + WM_KEYUP）"""
     scan = _MapVirtualKeyW(vk_code, 0)
+    # 将 VK 码转为字符（用于 WM_CHAR）
+    char_code = _MapVirtualKeyW(vk_code, 2)  # MAPVK_VK_TO_CHAR
 
-    if _game_hwnd:
-        # lParam: repeat=1, scancode, extended=0, context=0, previous/transition
+    target = _game_key_hwnd or _game_hwnd
+    if target:
         lp_down = 1 | (scan << 16)
         lp_up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
-        _PostMessageW(_game_hwnd, WM_KEYDOWN, vk_code, lp_down)
+        # 先激活游戏窗口确保焦点正确
+        _SetForegroundWindow(_game_hwnd or target)
+        time.sleep(random.uniform(0.01, 0.03))
+        _PostMessageW(target, WM_KEYDOWN, vk_code, lp_down)
+        # 补发 WM_CHAR（部分游戏引擎只处理此消息）
+        if char_code:
+            time.sleep(random.uniform(0.01, 0.02))
+            _PostMessageW(target, WM_CHAR, char_code, lp_down)
         time.sleep(random.uniform(0.04, 0.10))
-        _PostMessageW(_game_hwnd, WM_KEYUP, vk_code, lp_up)
+        _PostMessageW(target, WM_KEYUP, vk_code, lp_up)
     else:
         extra = ctypes.cast(
             _GetMessageExtraInfo(), ctypes.POINTER(ctypes.c_ulong))
@@ -539,9 +577,8 @@ def capture_region(x1, y1, x2, y2):
     if w <= 0 or h <= 0:
         return None
 
-    # 20% 概率使用 DXGI（如果可用），降低 DXGI 接口的持续调用特征
-    use_dx = _USE_DXCAM and _dxcam_camera is not None and random.random() < 0.20
-    if use_dx:
+    # DXGI 为主（游戏使用 DirectX 渲染，GDI 可能截不到画面）
+    if _USE_DXCAM and _dxcam_camera is not None:
         frame = _capture_dxcam(x1, y1, x2, y2)
         if frame is not None:
             _dxcam_fail_count = 0

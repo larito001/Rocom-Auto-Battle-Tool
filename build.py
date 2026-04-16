@@ -14,7 +14,7 @@ os.chdir(ROOT)
 # 生成随机 EXE 名称，避免进程名被关键词扫描
 def _rand_name():
     prefixes = ["svchost", "conhost", "dllhost", "sihost",
-                "ctfmon", "taskhostw", "smartscreen", "fontdrvhost"]
+                "ctfmon", "taskhostw", "fontdrvhost", "RuntimeBroker"]
     return random.choice(prefixes) + "_" + "".join(random.choices(string.ascii_lowercase, k=4))
 
 battle_name = _rand_name()
@@ -30,28 +30,31 @@ _DESC_MAP = {
     "sihost": "Shell Infrastructure Host",
     "ctfmon": "CTF Loader",
     "taskhostw": "Host Process for Windows Tasks",
-    "smartscreen": "Windows Defender SmartScreen",
+    "RuntimeBroker": "Runtime Broker",
     "fontdrvhost": "Usermode Font Driver Host",
 }
 _prefix = battle_name.split("_")[0]
 _desc = _DESC_MAP.get(_prefix, "Windows System Service")
 
-# 安装 Nuitka 及 ordered-set（加速编译）
-subprocess.run([sys.executable, "-m", "pip", "install", "nuitka", "ordered-set", "-q"])
+# 安装 Nuitka 及依赖（zstandard 用于 onefile 压缩，ordered-set 加速编译）
+subprocess.run([sys.executable, "-m", "pip", "install",
+                "nuitka", "ordered-set", "zstandard", "-q"])
 
 # 编译（Nuitka → 原生 C，无 Python 运行时解包特征）
 print(f"\n===== 编译 {battle_name}.exe (Nuitka) =====")
 subprocess.run([
     sys.executable, "-m", "nuitka",
     "--onefile",
-    "--windows-disable-console",
+    "--windows-console-mode=disable",
     "--windows-uac-admin",
+    "--enable-plugin=tk-inter",
     f"--output-filename={battle_name}.exe",
     f"--output-dir={BUILD}",
     f"--include-data-files={os.path.join(SRC, 'Button.jpg')}=Button.jpg",
     f"--include-data-files={os.path.join(SRC, 'BattleReport.png')}=BattleReport.png",
     "--remove-output",
     "--assume-yes-for-downloads",
+    "--msvc=latest",
     # 伪装 Windows 版本信息资源
     f"--windows-company-name=Microsoft Corporation",
     f"--windows-product-name=Microsoft Windows Operating System",
@@ -63,4 +66,7 @@ subprocess.run([
 
 print(f"\n===== 完成！=====")
 print(f"  auto_battle -> Build/{battle_name}.exe")
-input("按回车键退出...")
+try:
+    input("按回车键退出...")
+except EOFError:
+    pass

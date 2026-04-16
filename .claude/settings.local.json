@@ -10,7 +10,19 @@
       "WebSearch",
       "Bash(curl *)",
       "Bash(C:/Users/20723/Desktop/autoBattle/tools/interception/Interception/command line installer/install-interception.exe *)",
-      "Bash(powershell *)"
+      "Bash(powershell *)",
+      "Bash(taskkill //F //IM gcc.exe)",
+      "Bash(taskkill //F //IM cc1.exe)",
+      "Bash(taskkill //F //IM nuitka.exe)",
+      "Bash(tasklist)",
+      "Bash(taskkill //F //PID 19840)",
+      "Bash(taskkill //F //PID 832)",
+      "Bash(where cl.exe)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Bash(winget install *)",
+      "Bash(cmd *)",
+      "Bash(C:/Program Files \\(x86\\)/Microsoft Visual Studio/Installer/vswhere.exe *)"
     ]
   }
 }
