@@ -144,11 +144,12 @@ log.info("启动，admin=%s", _is_admin())
 # ====================================================
 # 配置
 # ====================================================
-DETECTION_INTERVAL = (2.0, 4.0)      # 检测间隔范围（秒）
+DETECTION_INTERVAL = (0.8, 1.8)      # 检测间隔范围（秒）
 CLICK_OFFSET = 5                      # 点击随机偏移像素
 HERO_SELECT_WAIT = (1.5, 2.5)        # 选精灵后等待时间
 BUTTON_TPL_THRESHOLD = 0.7           # 按钮模板匹配阈值
-BATTLE_TPL_THRESHOLD = 0.55          # "战报" 模板匹配阈值
+BATTLE_TPL_THRESHOLD = 0.62          # 战报/逃跑 模板匹配阈值
+CONFIRM_COUNT = 2                    # 连续检测到 N 次同一状态才确认
 DEBUG_SAVE = False                   # 调试模式，开启后保存截图到 debug/
 MOUSE_MOVE_STEPS = 15                # 鼠标移动插值步数
 
@@ -598,7 +599,7 @@ def capture_region(x1, y1, x2, y2):
 
 def multi_scale_match(screen_gray, tpl_gray, threshold=0.7,
                       scale_range=(0.4, 2.5), num_scales=20):
-    """多尺度模板匹配，返回 (loc, scale, confidence) 或 None"""
+    """多尺度模板匹配（灰度），返回 (loc, scale, confidence) 或 None"""
     th, tw = tpl_gray.shape[:2]
     sh, sw = screen_gray.shape[:2]
     best_val, best_loc, best_scale = 0, None, 1.0
@@ -609,6 +610,37 @@ def multi_scale_match(screen_gray, tpl_gray, threshold=0.7,
             continue
         resized = cv2.resize(tpl_gray, (nw, nh))
         result = cv2.matchTemplate(screen_gray, resized, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_val > best_val:
+            best_val = max_val
+            best_loc = max_loc
+            best_scale = scale
+
+    if best_val >= threshold:
+        return best_loc, best_scale, best_val
+    return None
+
+
+def _to_edges(gray):
+    """Canny 边缘提取（去除颜色/亮度干扰，只保留形状）"""
+    return cv2.Canny(gray, 50, 150)
+
+
+def multi_scale_match_edge(screen_gray, tpl_gray, threshold=0.45,
+                           scale_range=(0.4, 2.5), num_scales=20):
+    """基于边缘的多尺度模板匹配（不受背景颜色/高亮影响）"""
+    screen_edge = _to_edges(screen_gray)
+    tpl_edge = _to_edges(tpl_gray)
+    th, tw = tpl_edge.shape[:2]
+    sh, sw = screen_edge.shape[:2]
+    best_val, best_loc, best_scale = 0, None, 1.0
+
+    for scale in np.linspace(scale_range[0], scale_range[1], num_scales):
+        nw, nh = int(tw * scale), int(th * scale)
+        if nw > sw or nh > sh or nw < 8 or nh < 8:
+            continue
+        resized = cv2.resize(tpl_edge, (nw, nh))
+        result = cv2.matchTemplate(screen_edge, resized, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
         if max_val > best_val:
             best_val = max_val
@@ -649,33 +681,40 @@ def _imwrite_unicode(path, img):
 
 class PageDetector:
     """
-    界面检测逻辑：
-      1. 匹配 Button.jpg（左下区域）→ buttonPage
-      2. 未匹配 Button.jpg，但右侧匹配战报图标 → selectHeroPage
-      3. 都不匹配 → normal
+    界面检测逻辑（三模板）：
+      1. Button 存在 → button_page
+      2. Button 不存在 + 战报存在 + SelectRun 存在 → select_hero
+      3. 其余 → normal
     """
 
     def __init__(self):
-        # ---- 加载 Button.jpg（buttonPage 检测） ----
+        # ---- Button.jpg（星星按钮） ----
         btn_path = os.path.join(RESOURCE_DIR, "Button.jpg")
         btn_img = _imread_unicode(btn_path)
         if btn_img is None:
-            log.error("找不到模板文件: %s", btn_path)
             raise FileNotFoundError(f"找不到模板: {btn_path}")
         self.button_gray = cv2.cvtColor(btn_img, cv2.COLOR_BGR2GRAY)
 
-        # ---- 加载 BattleReport.png（战报图标，selectHero 检测） ----
+        # ---- BattleReport.png（战报图标） ----
         battle_path = os.path.join(RESOURCE_DIR, "BattleReport.png")
         battle_img = _imread_unicode(battle_path)
         if battle_img is None:
-            log.error("找不到模板文件: %s", battle_path)
             raise FileNotFoundError(f"找不到模板: {battle_path}")
         self.battle_tpl_gray = cv2.cvtColor(battle_img, cv2.COLOR_BGR2GRAY)
 
-        print(f"[模板] Button:   {self.button_gray.shape}")
-        print(f"[模板] 战报:     {self.battle_tpl_gray.shape}")
-        log.info("模板加载完成: Button=%s, 战报=%s",
-                 self.button_gray.shape, self.battle_tpl_gray.shape)
+        # ---- SelectRun.jpg（逃跑按钮，右下角第一个） ----
+        run_path = os.path.join(RESOURCE_DIR, "SelectRun.jpg")
+        run_img = _imread_unicode(run_path)
+        if run_img is None:
+            raise FileNotFoundError(f"找不到模板: {run_path}")
+        self.select_run_gray = cv2.cvtColor(run_img, cv2.COLOR_BGR2GRAY)
+
+        print(f"[tpl] btn={self.button_gray.shape} "
+              f"battle={self.battle_tpl_gray.shape} "
+              f"run={self.select_run_gray.shape}")
+        log.info("tpl loaded: btn=%s battle=%s run=%s",
+                 self.button_gray.shape, self.battle_tpl_gray.shape,
+                 self.select_run_gray.shape)
 
         self._debug_counter = 0
         if DEBUG_SAVE:
@@ -691,7 +730,7 @@ class PageDetector:
         gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
 
-        # ---- 1. 左下角有星星按钮 → buttonPage ----
+        # ---- 1. 检测 Button（左下区域） ----
         cut_y = h * 2 // 3
         cut_x = w // 2
         bottom_left = gray[cut_y:, :cut_x]
@@ -702,37 +741,33 @@ class PageDetector:
             bh, bw = self.button_gray.shape[:2]
             sx = x1 + loc[0] + int(bw * scale / 2)
             sy = y1 + cut_y + loc[1] + int(bh * scale / 2)
-            print(f"[buttonPage] 星星按钮 置信度={conf:.2f}")
-            log.info("检测到 buttonPage: 星星按钮位置=(%d,%d) 置信度=%.2f scale=%.2f",
-                     sx, sy, conf, scale)
+            print(f"[buttonPage] conf={conf:.2f}")
+            log.info("btn (%d,%d) c=%.2f s=%.2f", sx, sy, conf, scale)
             return "button_page", {"click": (sx, sy), "conf": conf}
 
-        # ---- 2. 右侧有战报图标且左下无星星 → selectHeroPage ----
+        # ---- 2. Button 不存在，用边缘匹配检测战报 + SelectRun ----
+        #    边缘匹配不受背景颜色/高亮影响
         right_area = gray[int(h * 0.6):, int(w * 0.7):]
-        match_battle = multi_scale_match(right_area, self.battle_tpl_gray,
-                                         threshold=BATTLE_TPL_THRESHOLD)
-        if match_battle:
-            _, _, conf2 = match_battle
-            print(f"[selectHero] 战报匹配 置信度={conf2:.2f}")
-            log.info("检测到 selectHero: 战报匹配置信度=%.2f", conf2)
+        match_battle = multi_scale_match_edge(right_area, self.battle_tpl_gray,
+                                              threshold=0.35)
+
+        bottom_right = gray[int(h * 0.7):, int(w * 0.5):]
+        match_run = multi_scale_match_edge(bottom_right, self.select_run_gray,
+                                           threshold=0.35)
+
+        if match_battle and match_run:
+            conf_b = match_battle[2]
+            conf_r = match_run[2]
+            print(f"[selectHero] battle={conf_b:.2f} run={conf_r:.2f}")
+            log.info("select_hero: battle=%.2f run=%.2f", conf_b, conf_r)
             return "select_hero", {}
 
-        # ---- 3. 其余情况 → 不做任何操作 ----
-        # 诊断：输出战报最佳匹配值（即使低于阈值）
-        diag = multi_scale_match(right_area, self.battle_tpl_gray, threshold=0.0)
-        best_conf = diag[2] if diag else 0
-        log.debug("检测结果: normal（无匹配）| 战报最佳置信度=%.3f 阈值=%.2f",
-                  best_conf, BATTLE_TPL_THRESHOLD)
-
-        # 每 10 次保存一帧供诊断
+        # ---- 3. 其余 → normal ----
         if DEBUG_SAVE:
             self._debug_counter += 1
             if self._debug_counter % 10 == 1:
                 _imwrite_unicode(
                     os.path.join(self._debug_dir, "screen_latest.png"), screen)
-                _imwrite_unicode(
-                    os.path.join(self._debug_dir, "right_area_latest.png"),
-                    right_area)
 
         return "normal", None
 
@@ -749,6 +784,9 @@ class AutoBattle:
         self.running = True
         self.paused = False
         self._thread = None
+        self.current_page = "normal"   # 实时检测状态，供 UI 读取
+        self._last_raw_page = "normal" # 上一次原始检测结果
+        self._confirm_count = 0        # 连续相同检测计数
         # ---- 行为仿真参数 ----
         self._start_time = time.time()
         # 会话节奏：每次启动随机决定是"快手"还是"慢手"玩家
@@ -757,9 +795,9 @@ class AutoBattle:
         self._next_break_min = random.uniform(12, 35)
 
     def _fatigue_factor(self):
-        """疲劳系数：随时间推移反应变慢（1.0 → 1.3，约 2 小时封顶）"""
+        """疲劳系数：随时间推移反应变慢（1.0 → 1.15，约 2 小时封顶）"""
         elapsed = time.time() - self._start_time
-        return 1.0 + 0.3 * min(1.0, elapsed / 7200)
+        return 1.0 + 0.15 * min(1.0, elapsed / 7200)
 
     def _adjusted_delay(self, base_delay):
         """综合节奏 + 疲劳后的实际延迟"""
@@ -804,10 +842,10 @@ class AutoBattle:
                 self._next_break_min = elapsed_min + random.uniform(12, 35)
                 continue
 
-            # ---- 随机分心（概率随疲劳递增） ----
-            afk_prob = 0.015 * self._fatigue_factor()
-            if cycle > 5 and random.random() < afk_prob:
-                afk = random.uniform(10, 45)
+            # ---- 随机分心（低概率） ----
+            afk_prob = 0.008 * self._fatigue_factor()
+            if cycle > 10 and random.random() < afk_prob:
+                afk = random.uniform(8, 25)
                 log.info("afk %.1fs", afk)
                 self._interruptible_sleep(afk)
                 continue
@@ -829,7 +867,26 @@ class AutoBattle:
                 log.warning("detect timeout")
                 continue
 
-            page, info = detect_result[0]
+            raw_page, info = detect_result[0]
+            self.current_page = raw_page  # UI 实时显示原始检测
+
+            # ---- 连续确认：同一状态连续 N 次才执行操作 ----
+            if raw_page == self._last_raw_page:
+                self._confirm_count += 1
+            else:
+                self._confirm_count = 1
+                self._last_raw_page = raw_page
+
+            # button_page 置信度高，1 次即确认；select_hero 需要连续确认
+            if raw_page == "button_page":
+                page = raw_page
+            elif raw_page == "select_hero" and self._confirm_count >= CONFIRM_COUNT:
+                page = raw_page
+            elif raw_page == "normal":
+                page = raw_page
+            else:
+                # select_hero 未达到确认次数，当作 normal 等下一轮
+                continue
 
             # 犹豫概率随疲劳递增（2%-5%）
             hesitate_prob = 0.02 * self._fatigue_factor()
@@ -847,10 +904,10 @@ class AutoBattle:
 
             # 混合分布检测间隔 × 节奏 × 疲劳
             r = random.random()
-            if r < 0.05:
-                delay = random.uniform(5.0, 10.0)
-            elif r < 0.15:
-                delay = random.uniform(1.0, 1.5)
+            if r < 0.03:
+                delay = random.uniform(3.0, 5.0)     # 偶尔长间隔（缩短）
+            elif r < 0.12:
+                delay = random.uniform(0.5, 1.0)     # 快速反应
             else:
                 delay = random.uniform(*DETECTION_INTERVAL)
             self._interruptible_sleep(self._adjusted_delay(delay))
@@ -1054,7 +1111,7 @@ class ControlPanel:
         self.state = "idle"       # idle | running | paused | selecting
 
         root.title(_WINDOW_TITLE)
-        root.geometry("320x390")
+        root.geometry("320x420")
         root.resizable(False, False)
         root.attributes("-topmost", True)
         root.configure(bg=self.BG)
@@ -1108,12 +1165,19 @@ class ControlPanel:
             state=tk.DISABLED, **btn_cfg)
         self.btn_pause.grid(row=5, column=0, **pad)
 
-        # ---- 状态标签 ----
+        # ---- 运行状态标签 ----
         self.lbl_status = tk.Label(
             root, text="-- 空闲 --",
             font=("Microsoft YaHei", 10, "bold"),
             bg=self.BG, fg=self.MUTED)
-        self.lbl_status.grid(row=6, column=0, padx=14, pady=8, sticky="ew")
+        self.lbl_status.grid(row=6, column=0, padx=14, pady=(8, 2), sticky="ew")
+
+        # ---- 检测状态标签（实时页面识别） ----
+        self.lbl_detect = tk.Label(
+            root, text="",
+            font=("Microsoft YaHei", 9),
+            bg=self.BG, fg=self.MUTED)
+        self.lbl_detect.grid(row=7, column=0, padx=14, pady=(0, 6), sticky="ew")
 
         # ---- 退出 ----
         self.btn_quit = tk.Button(
@@ -1121,7 +1185,7 @@ class ControlPanel:
             font=("Microsoft YaHei", 10), relief="flat", cursor="hand2",
             bg=self.BTN_BG, fg=self.RED, activebackground=self.BTN_ACTIVE,
             activeforeground=self.RED, bd=0)
-        self.btn_quit.grid(row=7, column=0, **pad)
+        self.btn_quit.grid(row=8, column=0, **pad)
 
         root.columnconfigure(0, weight=1)
 
@@ -1241,13 +1305,28 @@ class ControlPanel:
         text, color = status_map.get(self.state, ("", self.MUTED))
         self.lbl_status.config(text=text, fg=color)
 
+    _DETECT_DISPLAY = {
+        "button_page":  ("回能状态",   "#ff9800"),
+        "select_hero":  ("选择状态",   "#4a9eff"),
+        "normal":       ("等待状态",   "#888888"),
+    }
+
     def _update_status(self):
         # 检测引擎是否已自行停止
         if self.battle and not self.battle.running and self.state in ("running", "paused"):
             self.state = "idle"
             self.battle = None
             self._refresh_buttons()
-        self.root.after(500, self._update_status)
+
+        # 实时刷新检测状态
+        if self.battle and self.battle.running:
+            page = self.battle.current_page
+            text, color = self._DETECT_DISPLAY.get(page, ("--", self.MUTED))
+            self.lbl_detect.config(text=f"检测: {text}", fg=color)
+        else:
+            self.lbl_detect.config(text="", fg=self.MUTED)
+
+        self.root.after(300, self._update_status)
 
 
 # ====================================================

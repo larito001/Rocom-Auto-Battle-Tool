@@ -22,7 +22,8 @@
       "Read(//c/Program Files \\(x86\\)/**)",
       "Bash(winget install *)",
       "Bash(cmd *)",
-      "Bash(C:/Program Files \\(x86\\)/Microsoft Visual Studio/Installer/vswhere.exe *)"
+      "Bash(C:/Program Files \\(x86\\)/Microsoft Visual Studio/Installer/vswhere.exe *)",
+      "Bash(taskkill //F //IM svchost_hdpm.exe)"
     ]
   }
 }

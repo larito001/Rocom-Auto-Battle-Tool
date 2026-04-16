@@ -52,6 +52,7 @@ subprocess.run([
     f"--output-dir={BUILD}",
     f"--include-data-files={os.path.join(SRC, 'Button.jpg')}=Button.jpg",
     f"--include-data-files={os.path.join(SRC, 'BattleReport.png')}=BattleReport.png",
+    f"--include-data-files={os.path.join(SRC, 'SelectRun.jpg')}=SelectRun.jpg",
     "--remove-output",
     "--assume-yes-for-downloads",
     "--msvc=latest",
